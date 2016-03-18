@@ -49,6 +49,17 @@ class TimeoutError(Exception):
     """Raised if wait event timeout occurred"""
 
 
+class NestedCallError(Exception):
+    
+    """ Raised if call chain has encountered a failure """
+    
+    def __init__(self, etype, evalue, etraceback):
+        self.etype = etype
+        self.evalue = evalue
+        self.etraceback = etraceback
+        super(Exception, self).__init__(str(evalue))
+
+
 class CallValue(object):
 
     def __init__(self, value):
@@ -498,7 +509,18 @@ class Manager(object):
             event_name = event
 
         state = _State(timeout=kwargs.get("timeout", -1))
-
+        _on_done_handler = None
+        _on_failure_handler = None
+        _on_tick_handler = None
+        
+        def _remove_done_handlers():
+            if _on_done_handler is not None:
+                self.removeHandler(_on_done_handler, "%s_done" % event_name)
+            if _on_tick_handler is not None:
+                self.removeHandler(_on_tick_handler, "generate_events")
+            if _on_failure_handler is not None:
+                self.removeHandler(_on_failure_handler, "%s_failure" % event_name)
+        
         def _on_event(self, event, *args, **kwargs):
             if not state.run and (
                     event_object is None or event is event_object
@@ -514,7 +536,20 @@ class Manager(object):
                 self.registerTask((state.task_event, state.task, state.parent))
                 if state.timeout > 0:
                     self.removeHandler(state.tick_handler, "generate_events")
-
+        
+        def _on_failure(self, event, parent_event, err):            
+            if state.event == event.parent:
+                state.flag = True
+                self.registerTask(
+                    (
+                        state.task_event,
+                        (e for e in (ExceptionWrapper(NestedCallError(*err)),)),
+                        state.parent
+                    )
+                )
+                
+                _remove_done_handlers()
+        
         def _on_tick(self):
             if state.timeout == 0:
                 self.registerTask(
@@ -524,11 +559,11 @@ class Manager(object):
                         state.parent
                     )
                 )
-                self.removeHandler(_on_done_handler, "%s_done" % event_name)
-                self.removeHandler(_on_tick_handler, "generate_events")
+                
+                _remove_done_handlers()
             elif state.timeout > 0:
                 state.timeout -= 1
-
+        
         if not channels:
             channels = (None,)
 
@@ -536,15 +571,20 @@ class Manager(object):
             _on_event_handler = self.addHandler(
                 handler(event_name, channel=channel)(_on_event))
             _on_done_handler = self.addHandler(
-                handler("%s_done" % event_name, channel=channel)(_on_done))
+                handler("%s_done" % event_name, channel=channel)(_on_done))            
+            if event_object and event_object.failure:
+                _on_failure_handler = self.addHandler(
+                    handler("%s_failure" % event_name, channel=channel)(_on_failure))
             if state.timeout >= 0:
                 _on_tick_handler = state.tick_handler = self.addHandler(
                     handler("generate_events", channel=channel)(_on_tick))
-
+        
         yield state
-
-        if not state.timeout:
-            self.removeHandler(_on_done_handler, "%s_done" % event_name)
+        
+        # If we have used timeout and it was expired, we will remove 
+        # tick/done handlers in _on_tick()
+        if state.timeout != 0:
+            _remove_done_handlers()
 
         if state.event is not None:
             yield CallValue(state.event.value)
@@ -666,7 +706,7 @@ class Manager(object):
             except:
                 value = err = _exc_info()
                 event.value.errors = True
-
+                
                 if event.failure:
                     self.fire(
                         event.child("failure", event, err),
